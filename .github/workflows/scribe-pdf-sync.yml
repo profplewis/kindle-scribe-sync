@@ -1,0 +1,98 @@
+name: Scribe PDF Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scribe-pdf-sync
+  cancel-in-progress: false
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      NBK_REMOTE: "scribe:Notes/Kindle Scribe/Notebooks"
+      PDF_REMOTE: "scribe:Notes/Kindle Scribe/PDFs"
+
+    steps:
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install NBK to PDF converter
+        run: |
+          bun add --global git+https://github.com/sergazin/neo_scribe_to_pdf.git
+          neo_scribe_to_pdf --version
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Restore rclone configuration
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+        run: |
+          test -n "$RCLONE_CONFIG_B64" || { echo "RCLONE_CONFIG_B64 secret is missing"; exit 1; }
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$RCLONE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          rclone lsd scribe: >/dev/null
+
+      - name: Download Scribe notebooks and existing PDFs
+        run: |
+          mkdir -p "$RUNNER_TEMP/scribe-nbk" "$RUNNER_TEMP/scribe-pdf"
+          rclone copy "$NBK_REMOTE" "$RUNNER_TEMP/scribe-nbk" \
+            --include '*.nbk' \
+            --create-empty-src-dirs \
+            --fast-list
+          rclone copy "$PDF_REMOTE" "$RUNNER_TEMP/scribe-pdf" \
+            --include '*.pdf' \
+            --create-empty-src-dirs \
+            --fast-list || true
+
+      - name: Convert new or changed notebooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          NBK_ROOT="$RUNNER_TEMP/scribe-nbk"
+          PDF_ROOT="$RUNNER_TEMP/scribe-pdf"
+
+          converted=0
+          skipped=0
+
+          while IFS= read -r -d '' nbk; do
+            rel="${nbk#"$NBK_ROOT"/}"
+            pdf="$PDF_ROOT/${rel%.nbk}.pdf"
+            mkdir -p "$(dirname "$pdf")"
+
+            if [[ -f "$pdf" && ! "$nbk" -nt "$pdf" ]]; then
+              echo "Unchanged: $rel"
+              skipped=$((skipped + 1))
+              continue
+            fi
+
+            echo "Converting: $rel"
+            neo_scribe_to_pdf "$nbk" --output "$pdf" --force --quiet
+            converted=$((converted + 1))
+          done < <(find "$NBK_ROOT" -type f -name '*.nbk' -print0)
+
+          echo "Converted: $converted"
+          echo "Unchanged: $skipped"
+
+      - name: Upload PDFs to Google Drive
+        run: |
+          rclone copy "$RUNNER_TEMP/scribe-pdf" "$PDF_REMOTE" \
+            --include '*.pdf' \
+            --create-empty-src-dirs \
+            --fast-list \
+            --transfers 4 \
+            --checkers 4
